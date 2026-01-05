@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Poke500 Index</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Daily PSA Grade 10 Composite</p>
+        <h1>Poke500 Index</h1>
+        <p class="lede">Grade 10 population-weighted average price for PSA-listed Pokémon cards. Updated daily.</p>
+      </div>
+      <div class="pill">Live</div>
+    </header>
+
+    <section class="summary" id="summary">
+      <div class="summary-card">
+        <p class="label">Latest Index</p>
+        <p class="value" id="latest-index">—</p>
+        <p class="meta" id="last-updated">Last updated: —</p>
+      </div>
+      <div class="summary-card">
+        <p class="label">Basket</p>
+        <p class="value" id="basket-size">—</p>
+        <p class="meta" id="basket-sum">Basket sum: —</p>
+      </div>
+      <div class="summary-card">
+        <p class="label">Universe</p>
+        <p class="value" id="universe-count">—</p>
+        <p class="meta">PSA cards with Grade 10 pricing</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">Index history</p>
+          <h2>Grade10 Index</h2>
+        </div>
+        <div class="legend">
+          <span class="dot"></span>
+          <span>Base 10,000</span>
+        </div>
+      </div>
+      <canvas id="indexChart" height="120"></canvas>
+      <p class="hint">History is built from daily runs of pk500.py via GitHub Actions.</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">Recent points</p>
+          <h2>Latest observations</h2>
+        </div>
+      </div>
+      <div id="table-container"></div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
