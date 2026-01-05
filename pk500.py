@@ -10,6 +10,11 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
+try:
+    import cloudscraper  # type: ignore
+except ImportError:
+    cloudscraper = None
+
 import unicodedata
 
 # ---- 調整パラメータ ----
@@ -65,12 +70,29 @@ class CardValue:
 session = requests.Session()
 session.headers.update(HEADERS)
 
+scraper = None
+if cloudscraper is not None:
+    # cloudscraper helps bypass basic Cloudflare/browser checks (common on PSA site)
+    scraper = cloudscraper.create_scraper(
+        browser={
+            "browser": "chrome",
+            "platform": "windows",
+            "mobile": False,
+        },
+    )
+    scraper.headers.update(HEADERS)
+
+
 def fetch(url: str, retries: int = 3) -> BeautifulSoup:
     """
     Basic fetch with light retry to reduce transient 403/5xx from PSA.
+    Fallback to cloudscraper when available.
     """
     for attempt in range(1, retries + 1):
         resp = session.get(url, timeout=30)
+        if resp.status_code == 403 and scraper:
+            # Try cloudscraper immediately on 403
+            resp = scraper.get(url, timeout=30)
         if resp.status_code == 403 and attempt < retries:
             time.sleep(SLEEP_SEC * attempt)
             continue
