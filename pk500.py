@@ -44,7 +44,15 @@ def is_pokemon_text(s: str) -> bool:
 
 BASE = "https://www.psacard.com"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; psa-index-research/1.0; +https://example.com)"
+    # Use a mainstream browser UA; prior custom UA could trigger 403 on psa site.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.psacard.com/",
 }
 
 
@@ -57,11 +65,20 @@ class CardValue:
 session = requests.Session()
 session.headers.update(HEADERS)
 
-def fetch(url: str) -> BeautifulSoup:
-    resp = session.get(url, timeout=30)
+def fetch(url: str, retries: int = 3) -> BeautifulSoup:
+    """
+    Basic fetch with light retry to reduce transient 403/5xx from PSA.
+    """
+    for attempt in range(1, retries + 1):
+        resp = session.get(url, timeout=30)
+        if resp.status_code == 403 and attempt < retries:
+            time.sleep(SLEEP_SEC * attempt)
+            continue
+        resp.raise_for_status()
+        time.sleep(SLEEP_SEC)
+        return BeautifulSoup(resp.text, "lxml")
+    # If we get here, last response was a 403
     resp.raise_for_status()
-    time.sleep(SLEEP_SEC)
-    return BeautifulSoup(resp.text, "lxml")
 
 def money_to_float(s: str) -> float:
     # "$5,777.50" -> 5777.50, "—" -> 0
