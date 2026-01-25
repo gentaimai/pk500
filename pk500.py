@@ -68,6 +68,8 @@ HEADERS = {
 class CardValue:
     name: str
     url: str
+    avg10_usd: float
+    pop10: int
     value_usd: float
 
 session = requests.Session()
@@ -307,59 +309,28 @@ def parse_card_value(card_url: str) -> CardValue | None:
         return bool(re.search(r"\b10\b", text))
 
     grade_col = idx_grade if idx_grade >= 0 else 0  # Grade列が取れない場合は先頭列をGrade扱い
-    value = 0.0
+    avg10 = 0.0
+    pop10 = 0
+
     rows = target.find_all("tr")
     for r in rows[1:]:
         cols = [c.get_text(" ", strip=True) for c in r.find_all(["td", "th"])]
         if len(cols) <= max(idx_avg, idx_pop):
             continue
+
         grade_text = cols[grade_col] if len(cols) > grade_col else ""
         if not is_grade_10(grade_text):
             continue
-        avg = money_to_float(cols[idx_avg])
-        pop = int_from(cols[idx_pop])
-        if avg > 0 and pop > 0:
-            value += avg * pop
 
-    if value <= 0:
+        avg10 = money_to_float(cols[idx_avg])
+        pop10 = int_from(cols[idx_pop])
+        break  # PSA10行が取れたらそれでOK
+
+    if avg10 <= 0 or pop10 <= 0:
         return None
 
-    return CardValue(name=name, url=card_url, value_usd=value)
-
-
-def compute_index(values_desc: list[CardValue]) -> dict:
-    """
-    values_desc: value_usd 降順にソート済みの CardValue リスト
-    """
-    n = len(values_desc)
-    if n == 0:
-        return {
-            "n_total": 0,
-            "k_used": 0,
-            "sum_value": 0.0,
-            "divisor_10000": None,
-            "index_level": None,
-        }
-
-    if n < 500:
-        k = max(1, n // 2)   # 上位半分（最低1）
-    else:
-        k = 500
-
-    basket = values_desc[:k]
-    s = sum(x.value_usd for x in basket)
-
-    # 10,000基準に正規化する divisor（初回用）
-    divisor = s / 10000.0 if s > 0 else None
-    index_level = (s / divisor) if divisor else None  # = 10000
-
-    return {
-        "n_total": n,
-        "k_used": k,
-        "sum_value": s,
-        "divisor_10000": divisor,
-        "index_level": index_level,
-    }
+    value = avg10 * pop10
+    return CardValue(name=name, url=card_url, avg10_usd=avg10, pop10=pop10, value_usd=value)
 
 def main():
     _, run_timestamp, run_timestamp_iso = current_run_times()
@@ -415,8 +386,9 @@ def main():
     n = len(all_values)
     basket_size = 0
     sum_value = 0.0
-    divisor_10000 = None
-    index_level = None
+    sum_pop10 = 0
+    pk500_avg = None
+
 
     if n == 0:
         print("\n=== Pseudo Index Summary ===")
@@ -432,22 +404,25 @@ def main():
             basket_size = 500
 
         basket = all_values[:basket_size]
+
+        # 分子：Σ(avg10 * pop10)
         sum_value = sum(x.value_usd for x in basket)
 
-        # 擬似指数: 10,000基準に正規化した divisor を併記
-        divisor_10000 = (sum_value / 10000.0) if sum_value > 0 else None
-        index_level = (sum_value / divisor_10000) if divisor_10000 else None  # = 10000
+        # 分母：Σ(pop10)
+        sum_pop10 = sum(x.pop10 for x in basket)
 
-        print("\n=== Pseudo Index Summary ===")
+        pk500_avg = (sum_value / sum_pop10) if sum_pop10 > 0 else None
+
+        print("\n=== PK500-A Summary (PSA10 Pop-weighted average price) ===")
         print(f"Total cards valued: {n}")
         print(f"Basket size used:  {basket_size}  (rule: n<500 => top half, else top500)")
-        print(f"Basket sum value:  ${sum_value:,.2f}")
-        if divisor_10000:
-            print(f"Divisor (10,000 base): {divisor_10000:.6f}")
-            print(f"Index level (base 10,000): {index_level:.2f}")
+        print(f"Basket sum value (USD):  ${sum_value:,.2f}  (Σ avg10*pop10)")
+        print(f"Basket total pop10:      {sum_pop10:,}     (Σ pop10)")
+        if pk500_avg is not None:
+            print(f"PK500-A (avg USD/PSA10): ${pk500_avg:,.2f}")
         else:
-            print("Divisor (10,000 base): N/A")
-            print("Index level (base 10,000): N/A")
+            print("PK500-A (avg USD/PSA10): N/A")
+
 
     # 6) 保存系
     # 6-1) Index履歴を追記
@@ -464,9 +439,9 @@ def main():
                     "run_timestamp_local",
                     "total_cards",
                     "basket_size",
-                    "basket_sum_value_usd",
-                    "divisor_10000",
-                    "index_level",
+                    "basket_sum_value_usd",     # Σ(avg10*pop10)
+                    "basket_total_pop10",       # Σ(pop10)
+                    "pk500_avg_usd",            # Σ(value) / Σ(pop10)
                 ]
             )
         w.writerow(
@@ -476,8 +451,8 @@ def main():
                 n,
                 basket_size,
                 f"{sum_value:.2f}",
-                f"{divisor_10000:.6f}" if divisor_10000 else "",
-                f"{index_level:.2f}" if index_level else "",
+                f"{sum_pop10}",
+                f"{pk500_avg:.2f}" if pk500_avg is not None else "",
             ]
         )
 
@@ -485,35 +460,32 @@ def main():
     # Top10
     with open("top10.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["rank", "value_usd", "name", "url"])
+        w.writerow(["rank", "value_usd", "avg10_usd", "pop10", "name", "url"])
         for i, cv in enumerate(top10, 1):
-            w.writerow([i, f"{cv.value_usd:.2f}", cv.name, cv.url])
+            w.writerow([i, f"{cv.value_usd:.2f}", f"{cv.avg10_usd:.2f}", cv.pop10, cv.name, cv.url])
 
     # Basket（指数計算に使ったカード一覧）
     # ※再現性のため出すのがおすすめ
     if n > 0:
         with open("basket.csv", "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["rank", "value_usd", "name", "url"])
+            w.writerow(["rank", "value_usd", "avg10_usd", "pop10", "name", "url"])
             for i, cv in enumerate(all_values[: (basket_size if n >= 1 else 0)], 1):
-                w.writerow([i, f"{cv.value_usd:.2f}", cv.name, cv.url])
+                w.writerow([i, f"{cv.value_usd:.2f}", f"{cv.avg10_usd:.2f}", cv.pop10, cv.name, cv.url])
 
     with open("run_info.txt", "w", encoding="utf-8") as f:
         f.write(f"Run timestamp: {run_timestamp}\n")
         f.write(f"Run timestamp ISO: {run_timestamp_iso}\n")
         f.write(f"Total cards valued: {n}\n")
         f.write(f"Basket size used: {basket_size}\n")
-        f.write(f"Basket sum value (USD): {sum_value:.2f}\n")
+        f.write(f"Basket sum value (USD, Σ avg10*pop10): {sum_value:.2f}\n")
+        f.write(f"Basket total pop10 (Σ pop10): {sum_pop10}\n")
         f.write(
-            f"Divisor (10,000 base): {divisor_10000:.6f}\n"
-            if divisor_10000
-            else "Divisor (10,000 base): N/A\n"
+            f"PK500-A (pop-weighted avg USD/PSA10): {pk500_avg:.2f}\n"
+            if pk500_avg is not None
+            else "PK500-A (pop-weighted avg USD/PSA10): N/A\n"
         )
-        f.write(
-            f"Index level (base 10,000): {index_level:.2f}\n"
-            if index_level
-            else "Index level (base 10,000): N/A\n"
-        )
+
 
     print("\nSaved: top10.csv")
     if n > 0:
