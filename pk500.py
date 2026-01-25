@@ -10,6 +10,9 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
+import random
+from typing import Optional
+
 try:
     import cloudscraper  # type: ignore
 except ImportError:
@@ -83,24 +86,80 @@ if cloudscraper is not None:
     scraper.headers.update(HEADERS)
 
 
-def fetch(url: str, retries: int = 3) -> BeautifulSoup:
+def fetch(
+    url: str,
+    retries: int = 7,
+    timeout: tuple[float, float] = (10.0, 60.0),  # (connect, read)
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+) -> BeautifulSoup:
     """
-    Basic fetch with light retry to reduce transient 403/5xx from PSA.
-    Fallback to cloudscraper when available.
+    Fetch with retry + exponential backoff + jitter.
+    - Retries on transient network errors (timeouts/connection), 403 (possible CF), 429, and 5xx.
+    - Uses full jitter: sleep = uniform(0, cap) where cap grows exponentially.
+    - Uses session first, then cloudscraper on 403 (and keeps using it if needed).
     """
+    last_exc: Optional[BaseException] = None
+
+    def _sleep_with_backoff(attempt: int, retry_after: Optional[str] = None) -> None:
+        # Honor Retry-After when provided (seconds). If invalid, ignore.
+        if retry_after:
+            try:
+                ra = float(retry_after)
+                time.sleep(min(ra, max_delay))
+                return
+            except ValueError:
+                pass
+
+        cap = min(max_delay, base_delay * (2 ** (attempt - 1)))
+        # full jitter: random between 0 and cap
+        time.sleep(random.uniform(0, cap))
+
     for attempt in range(1, retries + 1):
-        resp = session.get(url, timeout=30)
-        if resp.status_code == 403 and scraper:
-            # Try cloudscraper immediately on 403
-            resp = scraper.get(url, timeout=30)
-        if resp.status_code == 403 and attempt < retries:
-            time.sleep(SLEEP_SEC * attempt)
-            continue
-        resp.raise_for_status()
-        time.sleep(SLEEP_SEC)
-        return BeautifulSoup(resp.text, "lxml")
-    # If we get here, last response was a 403
-    resp.raise_for_status()
+        try:
+            # 1) Try normal session first
+            resp = session.get(url, timeout=timeout)
+
+            # 2) On 403, try cloudscraper (often helps with CF/browser checks)
+            if resp.status_code == 403 and scraper:
+                resp = scraper.get(url, timeout=timeout)
+
+            # Retryable HTTP statuses
+            if resp.status_code in (403, 429, 500, 502, 503, 504):
+                if attempt == retries:
+                    resp.raise_for_status()
+
+                retry_after = resp.headers.get("Retry-After")
+                _sleep_with_backoff(attempt, retry_after=retry_after)
+                continue
+
+            # Other HTTP errors are non-retryable
+            resp.raise_for_status()
+
+            # Normal pacing to reduce load (in addition to backoff on failures)
+            time.sleep(SLEEP_SEC)
+            return BeautifulSoup(resp.text, "lxml")
+
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
+            last_exc = e
+        except requests.exceptions.ConnectionError as e:
+            last_exc = e
+        except requests.exceptions.HTTPError as e:
+            # If it's a retryable code, retry; else raise immediately
+            status = getattr(e.response, "status_code", None)
+            if status in (403, 429, 500, 502, 503, 504):
+                last_exc = e
+            else:
+                raise
+
+        # If we got here, we are going to retry (unless last attempt)
+        if attempt == retries:
+            raise last_exc  # type: ignore[misc]
+
+        _sleep_with_backoff(attempt)
+
+    # Should not reach here
+    raise last_exc  # type: ignore[misc]
 
 def money_to_float(s: str) -> float:
     # "$5,777.50" -> 5777.50, "—" -> 0
