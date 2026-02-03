@@ -14,8 +14,8 @@ async function loadHistory() {
   const totalIdx = idx("total_cards");
   const basketIdx = idx("basket_size");
   const sumIdx = idx("basket_sum_value_usd");
-  const divIdx = idx("divisor_10000");
-  const indexIdx = idx("index_level");
+  const popIdx = idx("basket_total_pop10");
+  const indexIdx = idx("pk500_avg_usd");
 
   return lines.slice(1).map((line) => {
     const cols = line.split(",");
@@ -26,7 +26,7 @@ async function loadHistory() {
       total: Number(cols[totalIdx] || 0),
       basket: Number(cols[basketIdx] || 0),
       sum: Number(cols[sumIdx] || 0),
-      divisor: cols[divIdx] ? Number(cols[divIdx]) : null,
+      pop10: Number(cols[popIdx] || 0),
       index: Number.isFinite(indexVal) ? indexVal : null,
     };
   }).filter((d) => d.iso);
@@ -55,7 +55,7 @@ function renderChart(history) {
       labels,
       datasets: [
         {
-          label: "Index level",
+          label: "PK500-A",
           data,
           tension: 0.2,
           borderColor: "#7af2c2",
@@ -70,7 +70,7 @@ function renderChart(history) {
         legend: { display: false },
         tooltip: {
           callbacks: {
-            label: (ctx) => `Index: ${ctx.formattedValue}`,
+            label: (ctx) => `PK500-A: ${ctx.formattedValue}`,
           },
         },
       },
@@ -113,7 +113,7 @@ function renderTable(history) {
       <thead>
         <tr>
           <th>Date (local)</th>
-          <th>Index</th>
+          <th>PK500-A</th>
           <th>Basket size</th>
           <th>Universe</th>
         </tr>

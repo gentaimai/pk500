@@ -1,6 +1,10 @@
 import re
 import time
 import csv
+import os
+import argparse
+import random
+import glob
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from urllib.parse import urljoin
@@ -10,7 +14,6 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-import random
 from typing import Optional
 
 try:
@@ -21,7 +24,7 @@ except ImportError:
 import unicodedata
 
 # ---- 調整パラメータ ----
-SLEEP_SEC = 2.0          # リクエスト間隔（負荷軽減）
+SLEEP_SEC = float(os.getenv("SLEEP_SEC", "2.0"))  # リクエスト間隔（負荷軽減）
 MAX_SETS = None 
 ONLY_POKEMON = True      # ポケモンに絞る（指数用途なら通常True）
 DEBUG_LIMIT_CARDS = None # デバッグ用に読み込みカード枚数を制限するときに使う。例: 20とか 
@@ -35,6 +38,12 @@ def current_run_times():
     human = run_dt.strftime("%Y-%m-%d %H:%M:%S %Z%z")
     iso = run_dt.isoformat()
     return run_dt, human, iso
+
+
+def sleep_with_jitter(base_sec: float) -> None:
+    # Small jitter helps avoid burst patterns while keeping average rate.
+    jitter = random.uniform(0.2, 0.8)
+    time.sleep(base_sec + jitter)
 
 def is_pokemon_text(s: str) -> bool:
     """
@@ -139,7 +148,7 @@ def fetch(
             resp.raise_for_status()
 
             # Normal pacing to reduce load (in addition to backoff on failures)
-            time.sleep(SLEEP_SEC)
+            sleep_with_jitter(SLEEP_SEC)
             return BeautifulSoup(resp.text, "lxml")
 
         except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
@@ -259,6 +268,194 @@ def iter_card_urls_in_set(set_url: str):
                     next_url = urljoin(BASE, href)
                     break
 
+def shard_items(items: list[str], worker_id: int, worker_count: int) -> list[str]:
+    if worker_count <= 1:
+        return items
+    return [item for i, item in enumerate(items) if i % worker_count == worker_id]
+
+def collect_card_urls(set_urls: list[str]) -> list[str]:
+    card_urls: list[str] = []
+    for su in tqdm(set_urls, desc="Collecting cards from sets"):
+        for cu in iter_card_urls_in_set(su):
+            card_urls.append(cu)
+            if DEBUG_LIMIT_CARDS is not None and len(card_urls) >= DEBUG_LIMIT_CARDS:
+                break
+        if DEBUG_LIMIT_CARDS is not None and len(card_urls) >= DEBUG_LIMIT_CARDS:
+            break
+
+    # 重複除去（順序保持）
+    return list(dict.fromkeys(card_urls))
+
+def compute_card_values(card_urls: list[str]) -> list[CardValue]:
+    values: list[CardValue] = []
+    for cu in tqdm(card_urls, desc="Computing card values"):
+        cv = parse_card_value(cu)
+        if cv is None:
+            continue
+        values.append(cv)
+    return values
+
+def write_card_values_csv(values: list[CardValue], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["name", "url", "avg10_usd", "pop10", "value_usd"])
+        for cv in values:
+            w.writerow(
+                [
+                    cv.name,
+                    cv.url,
+                    f"{cv.avg10_usd:.6f}",
+                    cv.pop10,
+                    f"{cv.value_usd:.6f}",
+                ]
+            )
+
+def read_card_values(paths: list[str]) -> list[CardValue]:
+    values: list[CardValue] = []
+    seen_urls: set[str] = set()
+    for path in paths:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                url = (row.get("url") or "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                values.append(
+                    CardValue(
+                        name=(row.get("name") or "").strip(),
+                        url=url,
+                        avg10_usd=float(row.get("avg10_usd") or 0.0),
+                        pop10=int(row.get("pop10") or 0),
+                        value_usd=float(row.get("value_usd") or 0.0),
+                    )
+                )
+    return values
+
+def compute_outputs(all_values: list[CardValue]) -> dict:
+    # 指数計算用に全件を降順ソート
+    all_values.sort(key=lambda x: x.value_usd, reverse=True)
+
+    # Top10
+    top10 = all_values[:10]
+
+    # Basket / Summary
+    n = len(all_values)
+    basket_size = 0
+    sum_value = 0.0
+    sum_pop10 = 0
+    pk500_avg = None
+
+    if n > 0:
+        if n < 500:
+            basket_size = max(1, n // 2)  # 上位半分（最低1）
+        else:
+            basket_size = 500
+
+        basket = all_values[:basket_size]
+        sum_value = sum(x.value_usd for x in basket)
+        sum_pop10 = sum(x.pop10 for x in basket)
+        pk500_avg = (sum_value / sum_pop10) if sum_pop10 > 0 else None
+    else:
+        basket = []
+
+    return {
+        "all_values": all_values,
+        "top10": top10,
+        "basket": basket,
+        "n": n,
+        "basket_size": basket_size,
+        "sum_value": sum_value,
+        "sum_pop10": sum_pop10,
+        "pk500_avg": pk500_avg,
+    }
+
+def write_outputs(
+    outputs: dict,
+    run_timestamp: str,
+    run_timestamp_iso: str,
+    write_history: bool = True,
+) -> None:
+    all_values = outputs["all_values"]
+    top10 = outputs["top10"]
+    basket = outputs["basket"]
+    n = outputs["n"]
+    basket_size = outputs["basket_size"]
+    sum_value = outputs["sum_value"]
+    sum_pop10 = outputs["sum_pop10"]
+    pk500_avg = outputs["pk500_avg"]
+
+    # 6-1) Index履歴を追記
+    if write_history:
+        history_dir = Path("data")
+        history_dir.mkdir(parents=True, exist_ok=True)
+        history_path = history_dir / "index_history.csv"
+        history_exists = history_path.exists()
+        with history_path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if not history_exists:
+                w.writerow(
+                    [
+                        "run_timestamp_iso",
+                        "run_timestamp_local",
+                        "total_cards",
+                        "basket_size",
+                        "basket_sum_value_usd",     # Σ(avg10*pop10)
+                        "basket_total_pop10",       # Σ(pop10)
+                        "pk500_avg_usd",            # Σ(value) / Σ(pop10)
+                    ]
+                )
+            w.writerow(
+                [
+                    run_timestamp_iso,
+                    run_timestamp,
+                    n,
+                    basket_size,
+                    f"{sum_value:.2f}",
+                    f"{sum_pop10}",
+                    f"{pk500_avg:.2f}" if pk500_avg is not None else "",
+                ]
+            )
+
+    # 6-2) Top10
+    with open("top10.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "value_usd", "avg10_usd", "pop10", "name", "url"])
+        for i, cv in enumerate(top10, 1):
+            w.writerow([i, f"{cv.value_usd:.2f}", f"{cv.avg10_usd:.2f}", cv.pop10, cv.name, cv.url])
+
+    # 6-3) Basket
+    if n > 0:
+        with open("basket.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["rank", "value_usd", "avg10_usd", "pop10", "name", "url"])
+            for i, cv in enumerate(basket, 1):
+                w.writerow([i, f"{cv.value_usd:.2f}", f"{cv.avg10_usd:.2f}", cv.pop10, cv.name, cv.url])
+
+    # 6-4) Run info
+    with open("run_info.txt", "w", encoding="utf-8") as f:
+        f.write(f"Run timestamp: {run_timestamp}\n")
+        f.write(f"Run timestamp ISO: {run_timestamp_iso}\n")
+        f.write(f"Total cards valued: {n}\n")
+        f.write(f"Basket size used: {basket_size}\n")
+        f.write(f"Basket sum value (USD, Σ avg10*pop10): {sum_value:.2f}\n")
+        f.write(f"Basket total pop10 (Σ pop10): {sum_pop10}\n")
+        f.write(
+            f"PK500-A (pop-weighted avg USD/PSA10): {pk500_avg:.2f}\n"
+            if pk500_avg is not None
+            else "PK500-A (pop-weighted avg USD/PSA10): N/A\n"
+        )
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="PK500 index builder")
+    parser.add_argument("--mode", choices=["full", "collect", "merge"], default="full")
+    parser.add_argument("--worker-id", type=int, default=0)
+    parser.add_argument("--worker-count", type=int, default=1)
+    parser.add_argument("--parts-dir", default="data/parts")
+    parser.add_argument("--input-glob", default="data/parts/card_values_*.csv")
+    return parser.parse_args()
+
 def parse_card_value(card_url: str) -> CardValue | None:
     soup = fetch(card_url)
 
@@ -333,162 +530,89 @@ def parse_card_value(card_url: str) -> CardValue | None:
     return CardValue(name=name, url=card_url, avg10_usd=avg10, pop10=pop10, value_usd=value)
 
 def main():
+    args = parse_args()
     _, run_timestamp, run_timestamp_iso = current_run_times()
     print(f"Run timestamp: {run_timestamp}")
 
-    # POPルート（年→セット→カードURLを集めるため）
-    pop_root = get_tcg_root_url()
-    print(f"TCG root: {pop_root}")
+    if args.mode == "full" and args.worker_count != 1:
+        raise SystemExit("full mode does not support worker_count > 1")
 
-    # 1) Set URLs（POP年ページ→セット→APRセットURLに変換）
-    set_urls = list(iter_set_urls(pop_root))
-    print(f"Sets found: {len(set_urls)}")
+    if args.mode in {"full", "collect"}:
+        # POPルート（年→セット→カードURLを集めるため）
+        pop_root = get_tcg_root_url()
+        print(f"TCG root: {pop_root}")
 
-    # 2) Card URLs（セット→カードURL）
-    card_urls = []
-    for su in tqdm(set_urls, desc="Collecting cards from sets"):
-        for cu in iter_card_urls_in_set(su):
-            card_urls.append(cu)
-            if DEBUG_LIMIT_CARDS is not None and len(card_urls) >= DEBUG_LIMIT_CARDS:
-                break
-        if DEBUG_LIMIT_CARDS is not None and len(card_urls) >= DEBUG_LIMIT_CARDS:
-            break
+        # 1) Set URLs（POP年ページ→セット→APRセットURLに変換）
+        set_urls = list(iter_set_urls(pop_root))
+        print(f"Sets found: {len(set_urls)}")
 
-    # 重複除去（順序保持）
-    card_urls = list(dict.fromkeys(card_urls))
-    print(f"Card URLs collected: {len(card_urls)}")
+        # Shard sets across workers
+        set_urls = shard_items(set_urls, args.worker_id, args.worker_count)
+        print(f"Sets assigned to worker {args.worker_id}/{args.worker_count}: {len(set_urls)}")
 
-    # 3) Compute values
-    all_values: list[CardValue] = []
-    top10: list[CardValue] = []
+        # 2) Card URLs（セット→カードURL）
+        card_urls = collect_card_urls(set_urls)
+        print(f"Card URLs collected: {len(card_urls)}")
 
-    for cu in tqdm(card_urls, desc="Computing card values"):
-        cv = parse_card_value(cu)
-        if cv is None:
-            continue
+        # 3) Compute values
+        all_values = compute_card_values(card_urls)
 
-        all_values.append(cv)
+        if args.mode == "collect":
+            parts_dir = Path(args.parts_dir)
+            output_path = parts_dir / f"card_values_{args.worker_id}.csv"
+            write_card_values_csv(all_values, output_path)
+            print(f"Saved: {output_path}")
+            return
+    else:
+        all_values = []
 
-        # Top10更新（都度ソートでOK、件数小さいので十分速い）
-        top10.append(cv)
-        top10.sort(key=lambda x: x.value_usd, reverse=True)
-        top10 = top10[:10]
+    if args.mode == "merge":
+        paths = sorted(glob.glob(args.input_glob))
+        if not paths:
+            raise SystemExit(f"No card_values files found for glob: {args.input_glob}")
+        print(f"Reading {len(paths)} part files...")
+        all_values = read_card_values(paths)
 
-    # 指数計算用に全件を降順ソート
-    all_values.sort(key=lambda x: x.value_usd, reverse=True)
+    outputs = compute_outputs(all_values)
 
     # 4) Top10 Output
     print("\n=== TOP 10 (by Grade10 AvgPrice*Pop) ===")
-    for i, cv in enumerate(top10, 1):
+    for i, cv in enumerate(outputs["top10"], 1):
         print(f"{i:2d}. ${cv.value_usd:,.2f}  {cv.name}  ({cv.url})")
 
-    # 5) Pseudo Index (TopK sum rule)
-    n = len(all_values)
-    basket_size = 0
-    sum_value = 0.0
-    sum_pop10 = 0
-    pk500_avg = None
-
-
+    # 5) Summary
+    n = outputs["n"]
     if n == 0:
-        print("\n=== Pseudo Index Summary ===")
+        print("\n=== PK500-A Summary (PSA10 Pop-weighted average price) ===")
         print("Total cards valued: 0")
         print("Basket size used:  0")
-        print("Basket sum value:  $0.00")
-        print("Divisor (10,000 base): N/A")
-        print("Index level (base 10,000): N/A")
+        print("Basket sum value (USD):  $0.00")
+        print("Basket total pop10:      0")
+        print("PK500-A (avg USD/PSA10): N/A")
     else:
-        if n < 500:
-            basket_size = max(1, n // 2)  # 上位半分（最低1）
-        else:
-            basket_size = 500
-
-        basket = all_values[:basket_size]
-
-        # 分子：Σ(avg10 * pop10)
-        sum_value = sum(x.value_usd for x in basket)
-
-        # 分母：Σ(pop10)
-        sum_pop10 = sum(x.pop10 for x in basket)
-
-        pk500_avg = (sum_value / sum_pop10) if sum_pop10 > 0 else None
-
         print("\n=== PK500-A Summary (PSA10 Pop-weighted average price) ===")
-        print(f"Total cards valued: {n}")
-        print(f"Basket size used:  {basket_size}  (rule: n<500 => top half, else top500)")
-        print(f"Basket sum value (USD):  ${sum_value:,.2f}  (Σ avg10*pop10)")
-        print(f"Basket total pop10:      {sum_pop10:,}     (Σ pop10)")
-        if pk500_avg is not None:
-            print(f"PK500-A (avg USD/PSA10): ${pk500_avg:,.2f}")
+        print(f"Total cards valued: {outputs['n']}")
+        print(
+            "Basket size used:  "
+            f"{outputs['basket_size']}  (rule: n<500 => top half, else top500)"
+        )
+        print(
+            "Basket sum value (USD):  "
+            f"${outputs['sum_value']:,.2f}  (Σ avg10*pop10)"
+        )
+        print(
+            "Basket total pop10:      "
+            f"{outputs['sum_pop10']:,}     (Σ pop10)"
+        )
+        if outputs["pk500_avg"] is not None:
+            print(f"PK500-A (avg USD/PSA10): ${outputs['pk500_avg']:,.2f}")
         else:
             print("PK500-A (avg USD/PSA10): N/A")
 
-
-    # 6) 保存系
-    # 6-1) Index履歴を追記
-    history_dir = Path("data")
-    history_dir.mkdir(parents=True, exist_ok=True)
-    history_path = history_dir / "index_history.csv"
-    history_exists = history_path.exists()
-    with history_path.open("a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if not history_exists:
-            w.writerow(
-                [
-                    "run_timestamp_iso",
-                    "run_timestamp_local",
-                    "total_cards",
-                    "basket_size",
-                    "basket_sum_value_usd",     # Σ(avg10*pop10)
-                    "basket_total_pop10",       # Σ(pop10)
-                    "pk500_avg_usd",            # Σ(value) / Σ(pop10)
-                ]
-            )
-        w.writerow(
-            [
-                run_timestamp_iso,
-                run_timestamp,
-                n,
-                basket_size,
-                f"{sum_value:.2f}",
-                f"{sum_pop10}",
-                f"{pk500_avg:.2f}" if pk500_avg is not None else "",
-            ]
-        )
-
-    # 6-2) Top10
-    # Top10
-    with open("top10.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["rank", "value_usd", "avg10_usd", "pop10", "name", "url"])
-        for i, cv in enumerate(top10, 1):
-            w.writerow([i, f"{cv.value_usd:.2f}", f"{cv.avg10_usd:.2f}", cv.pop10, cv.name, cv.url])
-
-    # Basket（指数計算に使ったカード一覧）
-    # ※再現性のため出すのがおすすめ
-    if n > 0:
-        with open("basket.csv", "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["rank", "value_usd", "avg10_usd", "pop10", "name", "url"])
-            for i, cv in enumerate(all_values[: (basket_size if n >= 1 else 0)], 1):
-                w.writerow([i, f"{cv.value_usd:.2f}", f"{cv.avg10_usd:.2f}", cv.pop10, cv.name, cv.url])
-
-    with open("run_info.txt", "w", encoding="utf-8") as f:
-        f.write(f"Run timestamp: {run_timestamp}\n")
-        f.write(f"Run timestamp ISO: {run_timestamp_iso}\n")
-        f.write(f"Total cards valued: {n}\n")
-        f.write(f"Basket size used: {basket_size}\n")
-        f.write(f"Basket sum value (USD, Σ avg10*pop10): {sum_value:.2f}\n")
-        f.write(f"Basket total pop10 (Σ pop10): {sum_pop10}\n")
-        f.write(
-            f"PK500-A (pop-weighted avg USD/PSA10): {pk500_avg:.2f}\n"
-            if pk500_avg is not None
-            else "PK500-A (pop-weighted avg USD/PSA10): N/A\n"
-        )
-
+    write_outputs(outputs, run_timestamp, run_timestamp_iso, write_history=True)
 
     print("\nSaved: top10.csv")
-    if n > 0:
+    if outputs["n"] > 0:
         print("Saved: basket.csv")
     print("Saved: run_info.txt")
 

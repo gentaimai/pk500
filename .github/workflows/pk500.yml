@@ -15,7 +15,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run-pk500:
+  collect:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        worker: [0, 1]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set run timestamp
+        id: run_time
+        run: echo "timestamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pk500 (collect)
+        env:
+          SLEEP_SEC: "2.5"
+        run: |
+          python pk500.py \
+            --mode collect \
+            --worker-id ${{ matrix.worker }} \
+            --worker-count 2 \
+            --parts-dir data/parts
+
+      - name: Upload part
+        uses: actions/upload-artifact@v4
+        with:
+          name: card-values-${{ matrix.worker }}
+          path: data/parts/card_values_${{ matrix.worker }}.csv
+          if-no-files-found: error
+
+  merge:
+    needs: collect
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -28,13 +67,20 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run pk500
-        run: python pk500.py
+      - name: Download parts
+        uses: actions/download-artifact@v4
+        with:
+          path: data/parts
+          pattern: card-values-*
+          merge-multiple: true
+
+      - name: Run pk500 (merge)
+        run: python pk500.py --mode merge --input-glob "data/parts/card_values_*.csv"
 
       - name: Sync history to docs
         run: |
@@ -55,7 +101,7 @@ jobs:
           path: docs
 
   deploy:
-    needs: run-pk500
+    needs: merge
     runs-on: ubuntu-latest
     environment:
       name: github-pages
